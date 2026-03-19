@@ -16,17 +16,10 @@ LLM_CONFIG = {
     "proxy_url": "http://ncproxy1:8080"
 }
 TEST_TABLES = [
-    # "trn_event",
-    # "trn_std_rpt_dependencies",
-    "trn_extract_config",
-    "trn_data_export_config",
-    "trn_app_10g",
-    "trn_bnpp_bs_rpt",
-    "trn_bnpp_bs_lcr",
-    "trn_bnpp_bs_5g_rpt",
-    "trn_report",
+  
+   
 ]
-DOMAIN_CONTEXT = "LIQUIDITY REPORTING NORTH AMERICA"
+DOMAIN_CONTEXT = ""
 SAMPLE_VALUES_PER_COLUMN = 5
 OUTPUT_FILE = "data_dictionary.json"
 
