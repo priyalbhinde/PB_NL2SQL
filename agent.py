@@ -92,9 +92,9 @@ def _build_schema_index(data_dict: Dict[str, Any]) -> Tuple[Dict[str, Set[str]],
 def _select_candidate_tables(
     question: str,
     data_dict: Dict[str, Any],
-    max_tables: int = 2,
+    max_tables: int = 5,
 ) -> List[str]:
-    """Pick relevant tables based on question keywords."""
+    """Pick relevant tables based on question keywords (improved matching)."""
     if not data_dict:
         return []
 
@@ -103,15 +103,18 @@ def _select_candidate_tables(
 
     scores: Dict[str, int] = {}
     for tok in question_tokens:
+        # Increase weight for table name matches
         for tbl in table_index.get(tok, []):
-            scores[tbl] = scores.get(tbl, 0) + 3
+            scores[tbl] = scores.get(tbl, 0) + 5
+        # Column matches also suggest the table
         for tbl in column_index.get(tok, []):
-            scores[tbl] = scores.get(tbl, 0) + 1
+            scores[tbl] = scores.get(tbl, 0) + 3
 
     ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
     if not ranked:
         return []
-    return [t for t, _ in ranked[:max_tables]]
+    # Return up to max_tables, but include all that have relevant matches
+    return [t for t, score in ranked if score > 0][:max_tables]
 
 
 def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> str:
@@ -134,12 +137,22 @@ def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> s
     return "\n".join(blocks)
 
 
+def _clean_query(query: str) -> str:
+    """Clean up SQL query: remove extra whitespace and normalize newlines."""
+    # Replace multiple newlines with single space, preserve structure
+    query = re.sub(r'\s+', ' ', query.strip())
+    return query
+
+
 def _apply_result_limit(query: str, top_k: int) -> str:
-    """Ensure query returns at most top_k rows."""
+    """Ensure query returns at most top_k rows (only add if not present)."""
+    query = _clean_query(query)
     lc = query.lower()
-    if "limit" in lc or "fetch first" in lc or "rownum" in lc:
+    # Don't add limit if one already exists
+    if "limit" in lc or "fetch first" in lc or "rownum" in lc or "offset" in lc:
         return query
-    return query.strip().rstrip(";") + f" LIMIT {top_k}"
+    # Only add limit if user isn't asking for all rows explicitly
+    return query.rstrip(";") + f" LIMIT {top_k}"
 
 
 # ============================================================================
@@ -147,14 +160,17 @@ def _apply_result_limit(query: str, top_k: int) -> str:
 # ============================================================================
 
 GENERATE_QUERY_SYSTEM_PROMPT = """
-You are an agent designed to interact with a SQL database.
+You are an expert SQL agent designed to interact with a large database (1500+ tables, billions of rows).
 Given an input question, create a syntactically correct {dialect} query to run.
-Unless the user specifies a specific number of examples, limit your query to at most {top_k} results.
 
-You can order the results by a relevant column to return the most interesting examples.
-Never query for all columns from a specific table, only the relevant ones.
-
-DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+**IMPORTANT RULES:**
+1. Use ONLY the tables and columns listed in the schema below.
+2. Always return results using LIMIT {top_k} unless the user asks for all data.
+3. Select the relevant columns needed to answer the question. If the user asks for "all data from table X", use SELECT * FROM X.
+4. Order results by a relevant column to return the most interesting examples.
+5. Never use JOIN with unknown tables. Only join tables explicitly mentioned in the schema.
+6. DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
+7. Return ONLY the SQL query. No explanation or markdown formatting.
 """.strip()
 
 
@@ -206,19 +222,29 @@ def generate_sql_query(state: MessageState) -> Dict[str, Any]:
 
     # Load data dictionary and select relevant tables
     data_dict = load_data_dictionary(DATA_DICTIONARY_PATH)
-    candidate_tables = _select_candidate_tables(user_question, data_dict, max_tables=2)
+    candidate_tables = _select_candidate_tables(user_question, data_dict, max_tables=5)
     schema_hint = _format_schema_for_prompt(data_dict, candidate_tables)
 
     # Build system prompt with schema hints
     system_prompt = GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT)
     if schema_hint:
         system_prompt += "\n\n" + schema_hint
-        system_prompt += "\n\nOnly use the above tables and columns when generating the query."
+    else:
+        system_prompt += "\n\nNo specific schema hint available. Use your knowledge of common database patterns."
 
     # Generate query from LLM
     system_message = {"role": "system", "content": system_prompt}
     response = llm.invoke([system_message] + messages)
     query = getattr(response, "content", str(response)).strip()
+    
+    # Clean up the query: remove markdown code blocks, extra whitespace
+    if query.startswith("```sql"):
+        query = query[6:]
+    if query.startswith("```"):
+        query = query[3:]
+    if query.endswith("```"):
+        query = query[:-3]
+    
     query = _apply_result_limit(query, TOP_K_DEFAULT)
 
     # Return as AIMessage with tool_call for downstream routing
@@ -257,7 +283,20 @@ def check_query_safety(state: MessageState) -> Dict[str, Any]:
 
     response = llm.invoke([system_message, user_message])
     checked_query = getattr(response, "content", str(response)).strip()
-    checked_query = _apply_result_limit(checked_query, TOP_K_DEFAULT)
+    
+    # Clean up query: remove markdown code blocks
+    if checked_query.startswith("```sql"):
+        checked_query = checked_query[6:]
+    if checked_query.startswith("```"):
+        checked_query = checked_query[3:]
+    if checked_query.endswith("```"):
+        checked_query = checked_query[:-3]
+    
+    # Don't re-apply limits if already present
+    checked_query = _clean_query(checked_query)
+    lc = checked_query.lower()
+    if "limit" not in lc and "fetch first" not in lc and "rownum" not in lc:
+        checked_query = checked_query.rstrip(";") + f" LIMIT {TOP_K_DEFAULT}"
 
     # If the query changed, update the tool call
     if checked_query != original_query:
@@ -275,8 +314,22 @@ def check_query_safety(state: MessageState) -> Dict[str, Any]:
                 )
             ]
         }
-
-    return {"messages": messages}
+    else:
+        # Update the original tool call args with the cleaned query
+        updated_tool_call = {
+            "name": "sql_db_query",
+            "args": {"query": checked_query},
+            "id": tool_call.get("id", "query_call"),
+            "type": "tool_call",
+        }
+        return {
+            "messages": messages[:-1] + [
+                AIMessage(
+                    content=last_message.content,
+                    tool_calls=[updated_tool_call]
+                )
+            ]
+        }
 
 
 def execute_query(state: MessageState) -> Dict[str, Any]:
@@ -297,8 +350,10 @@ def execute_query(state: MessageState) -> Dict[str, Any]:
     # Execute query using the toolkit tool
     try:
         result = run_query_tool.invoke(query)
+        # Clean up result display
+        result_str = str(result).strip()
         result_message = ToolMessage(
-            content=str(result),
+            content=f"Query executed successfully.\n\nResults:\n{result_str}",
             tool_call_id=tool_call.get("id", "query_call")
         )
     except Exception as e:
