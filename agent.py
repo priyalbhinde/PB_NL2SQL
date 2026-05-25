@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from utils import load_chat_model
+from utils import load_chat_model, get_message_text
 from langchain_openai import ChatOpenAI
 from sqlalchemy import create_engine
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
@@ -226,8 +226,10 @@ def _clean_query(query: str) -> str:
     return query
 
 
-def _load_query_examples(path: str) -> List[Dict[str, Any]]:
+def _load_query_examples(path: str) -> Optional[List[Dict[str, Any]]]:
     examples = load_json_file(path)
+    if examples is None:
+        return None
     if isinstance(examples, list):
         return [e for e in examples if isinstance(e, dict)]
     return []
@@ -265,8 +267,10 @@ def _format_query_examples_for_prompt(examples: List[Dict[str, Any]]) -> str:
     return "\n".join(blocks)
 
 
-def _load_fk_join_map(path: str) -> Dict[str, List[str]]:
+def _load_fk_join_map(path: str) -> Optional[Dict[str, List[str]]]:
     join_map = load_json_file(path)
+    if join_map is None:
+        return None
     if isinstance(join_map, dict):
         return {str(k): list(v) for k, v in join_map.items() if isinstance(v, list)}
     return {}
@@ -415,6 +419,16 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         }
 
     data_dict = load_data_dictionary(DATA_DICTIONARY_PATH)
+    query_examples = _load_query_examples(QUERY_EXAMPLES_PATH)
+    fk_map = _load_fk_join_map(FK_JOIN_PATH)
+
+    if query_examples is None or fk_map is None:
+        error_message = (
+            "Required configuration is missing. The query examples file or foreign-key join file "
+            "could not be loaded. Please ensure QUERY_EXAMPLES_PATH and FK_JOIN_PATH are set and the files exist."
+        )
+        return {"messages": messages + [AIMessage(content=error_message)]}
+
     candidate_tables = _select_candidate_tables(user_question, data_dict, max_tables=5)
 
     if not candidate_tables:
@@ -425,10 +439,8 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         return {"messages": messages + [AIMessage(content=clarification)]}
 
     schema_hint = _format_schema_for_prompt(data_dict, candidate_tables)
-    examples = _load_query_examples(QUERY_EXAMPLES_PATH)
-    selected_examples = _select_query_examples(user_question, examples, max_examples=3)
+    selected_examples = _select_query_examples(user_question, query_examples, max_examples=3)
     examples_hint = _format_query_examples_for_prompt(selected_examples)
-    fk_map = _load_fk_join_map(FK_JOIN_PATH)
     fk_hint = _format_fk_join_hints(candidate_tables, fk_map)
 
     system_prompt = GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT)
