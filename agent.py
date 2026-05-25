@@ -31,14 +31,14 @@ DB_URL = os.environ.get("DB_URL", "sqlite:///:memory:")
 INCLUDE_TABLES: Optional[List[str]] = None
 DATA_DICTIONARY_PATH = os.environ.get("DATA_DICTIONARY_PATH", "data_dictionary.json")
 QUERY_EXAMPLES_PATH = os.environ.get("QUERY_EXAMPLES_PATH", "query_examples.json")
-FOREIGN_KEYS_PATH = os.environ.get("FOREIGN_KEYS_PATH", "foreign_keys.json")
+FK_JOIN_PATH = os.environ.get("FK_JOIN_PATH", "foreign_keys.json")
 TOP_K_DEFAULT = 20
 
 # Cache for repeated queries and large schema support
 _DATA_DICTIONARY_CACHE: Dict[str, Any] = {}
-_SCHEMA_INDEX_CACHE: Optional[Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]] = None
 _QUERY_EXAMPLES_CACHE: Dict[str, Any] = {}
-_FOREIGN_KEYS_CACHE: Dict[str, Any] = {}
+_FK_JOIN_CACHE: Dict[str, Any] = {}
+_SCHEMA_INDEX_CACHE: Optional[Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]] = None
 
 # ============================================================================
 # Initialize LLM, Database, and Tools
@@ -85,151 +85,35 @@ def load_data_dictionary(path: str) -> Dict[str, Any]:
         return {}
 
 
-def load_json_payload(path: str, cache: Dict[str, Any]) -> Any:
-    """Load a JSON payload with simple path-based caching."""
-    if cache.get("path") == path:
-        return cache.get("data", {})
+def load_json_file(path: str) -> Any:
+    """Load any JSON file and cache by path."""
+    cache = _QUERY_EXAMPLES_CACHE if path == QUERY_EXAMPLES_PATH else _FK_JOIN_CACHE if path == FK_JOIN_PATH else None
+    if cache is not None and cache.get("path") == path:
+        return cache.get("data")
 
     path_obj = Path(path)
     if not path_obj.exists():
-        cache.clear()
-        cache.update({"path": path, "data": {}})
-        return {}
+        if cache is not None:
+            cache["path"] = path
+            cache["data"] = None
+        return None
 
     try:
-        with path_obj.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-            cache.clear()
-            cache.update({"path": path, "data": data})
+        with path_obj.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            if cache is not None:
+                cache["path"] = path
+                cache["data"] = data
             return data
     except Exception:
-        cache.clear()
-        cache.update({"path": path, "data": {}})
-        return {}
-
-
-def load_query_examples(path: str) -> List[Dict[str, str]]:
-    """Load few-shot query examples from JSON."""
-    raw = load_json_payload(path, _QUERY_EXAMPLES_CACHE)
-    if isinstance(raw, dict):
-        raw = raw.get("Queries") or raw.get("queries") or raw.get("examples") or []
-
-    examples: List[Dict[str, str]] = []
-    if isinstance(raw, list):
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            question = str(item.get("question", "")).strip()
-            query = str(item.get("query", "")).strip()
-            reasoning = str(item.get("reasoning", "")).strip()
-            if question and query:
-                examples.append({"question": question, "query": query, "reasoning": reasoning})
-    return examples
-
-
-def load_join_hints(path: str) -> Dict[str, List[str]]:
-    """Load foreign-key join hints keyed by 'table1|table2'."""
-    raw = load_json_payload(path, _FOREIGN_KEYS_CACHE)
-    if not isinstance(raw, dict):
-        return {}
-
-    normalized: Dict[str, List[str]] = {}
-    for key, value in raw.items():
-        if not isinstance(value, list):
-            continue
-        normalized[str(key)] = [str(item) for item in value if str(item).strip()]
-    return normalized
+        if cache is not None:
+            cache["path"] = path
+            cache["data"] = None
+        return None
 
 
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9_]+", text.lower()) if len(t) > 1]
-
-
-def _question_references_previous_context(question: str) -> bool:
-    normalized = question.lower()
-    patterns = [
-        r"\bprevious\b",
-        r"\bpreceding\b",
-        r"\babove\b",
-        r"\bearlier\b",
-        r"\bas previous\b",
-        r"\bas above\b",
-        r"\bsame as\b",
-        r"\blike above\b",
-        r"\bthat one\b",
-        r"\bthose\b",
-    ]
-    return any(re.search(pattern, normalized) for pattern in patterns)
-
-
-def _extract_user_turns(messages: List[BaseMessage]) -> List[str]:
-    turns: List[str] = []
-    for msg in messages:
-        if isinstance(msg, BaseMessage) and getattr(msg, "type", "") == "human":
-            content = getattr(msg, "content", "")
-            if isinstance(content, str) and content.strip():
-                turns.append(content.strip())
-    return turns
-
-
-def _build_context_snippet(messages: List[BaseMessage], current_question: str, max_turns: int = 2) -> str:
-    user_turns = [turn for turn in _extract_user_turns(messages) if turn != current_question]
-    if not user_turns:
-        return ""
-
-    recent_turns = user_turns[-max_turns:]
-    blocks = ["Relevant previous user context:"]
-    for index, turn in enumerate(recent_turns, start=1):
-        blocks.append(f"{index}. {turn}")
-    blocks.append(
-        "Use this context only because the latest question explicitly refers back to previous/above context. "
-        "If the latest question stands alone, ignore earlier turns."
-    )
-    return "\n".join(blocks)
-
-
-def _score_text_overlap(text: str, query_tokens: Set[str]) -> int:
-    return sum(1 for token in _tokenize(text) if token in query_tokens)
-
-
-def _select_relevant_examples(question: str, examples: List[Dict[str, str]], max_examples: int = 3) -> List[Dict[str, str]]:
-    if not examples:
-        return []
-
-    question_tokens = set(_tokenize(question))
-    scored = []
-    for example in examples:
-        combined = " ".join([
-            example.get("question", ""),
-            example.get("reasoning", ""),
-            example.get("query", ""),
-        ])
-        score = _score_text_overlap(combined, question_tokens)
-        if score > 0:
-            scored.append((score, example))
-
-    if not scored:
-        return examples[:max_examples]
-
-    scored.sort(key=lambda item: (-item[0], item[1].get("question", "")))
-    return [item[1] for item in scored[:max_examples]]
-
-
-def _format_examples_for_prompt(examples: List[Dict[str, str]]) -> str:
-    if not examples:
-        return ""
-
-    blocks = [
-        "Solved examples from your own query history:",
-        "Use these as structural patterns only. Do not copy tables or columns unless they exist in the current schema.",
-    ]
-    for index, example in enumerate(examples, start=1):
-        blocks.append(f"Example {index}:")
-        blocks.append(f"  question: {example.get('question', '')}")
-        if example.get("reasoning"):
-            blocks.append(f"  reasoning: {example.get('reasoning', '')}")
-        blocks.append(f"  query: {example.get('query', '')}")
-    return "\n".join(blocks)
 
 
 def _build_schema_index(data_dict: Dict[str, Any]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
@@ -312,13 +196,14 @@ def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> s
             name = col.get("name")
             col_type = col.get("type") or "UNKNOWN"
             col_desc = col.get("col_description") or ""
-            sample_values = col.get("_prompt_samples") or []
-            sample_text = ", ".join(str(value) for value in sample_values[:3] if str(value).strip())
-            sample_suffix = f" | samples: {sample_text}" if sample_text else ""
+            sample_values = [str(x) for x in (col.get("_prompt_samples") or []) if x is not None]
             if col_desc:
-                blocks.append(f"    - {name} ({col_type}): {col_desc}{sample_suffix}")
+                blocks.append(f"    - {name} ({col_type}): {col_desc}")
             else:
-                blocks.append(f"    - {name} ({col_type}){sample_suffix}")
+                blocks.append(f"    - {name} ({col_type})")
+            if sample_values:
+                samples = ", ".join(sample_values[:3])
+                blocks.append(f"      sample_values: {samples}")
 
         foreign_keys = info.get("foreign_keys") or []
         if foreign_keys:
@@ -334,37 +219,113 @@ def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> s
     return "\n".join(blocks)
 
 
-def _format_join_hints_for_prompt(join_hints: Dict[str, List[str]], selected_tables: List[str]) -> str:
-    if len(selected_tables) < 2 or not join_hints:
-        return ""
-
-    selected = set(selected_tables)
-    blocks = [
-        "Join hints from the join-key dictionary:",
-        "Use these join columns when a query needs more than one table.",
-    ]
-
-    matched = False
-    for left_index, left_table in enumerate(selected_tables):
-        for right_table in selected_tables[left_index + 1:]:
-            forward_key = f"{left_table}|{right_table}"
-            reverse_key = f"{right_table}|{left_table}"
-            join_columns = join_hints.get(forward_key) or join_hints.get(reverse_key)
-            if join_columns:
-                matched = True
-                blocks.append(f"- {left_table} <-> {right_table}: join on {', '.join(join_columns)}")
-
-    if not matched:
-        return ""
-
-    return "\n".join(blocks)
-
-
 def _clean_query(query: str) -> str:
     """Clean up SQL query: remove extra whitespace and normalize newlines."""
     # Replace multiple newlines with single space, preserve structure
     query = re.sub(r'\s+', ' ', query.strip())
     return query
+
+
+def _load_query_examples(path: str) -> List[Dict[str, Any]]:
+    examples = load_json_file(path)
+    if isinstance(examples, list):
+        return [e for e in examples if isinstance(e, dict)]
+    return []
+
+
+def _select_query_examples(question: str, examples: List[Dict[str, Any]], max_examples: int = 3) -> List[Dict[str, Any]]:
+    question_tokens = set(_tokenize(question))
+    scored: List[Tuple[int, Dict[str, Any]]] = []
+    for example in examples:
+        example_question = str(example.get("question", ""))
+        example_tokens = set(_tokenize(example_question))
+        score = len(question_tokens & example_tokens)
+        if score > 0:
+            scored.append((score, example))
+    scored.sort(key=lambda item: (-item[0], str(item[1].get("question", ""))))
+    return [example for _, example in scored[:max_examples]]
+
+
+def _format_query_examples_for_prompt(examples: List[Dict[str, Any]]) -> str:
+    if not examples:
+        return ""
+    blocks: List[str] = [
+        "Example query patterns:",
+        "Use these examples as design patterns. If the current question matches one, follow the same SQL style and filtering logic.",
+    ]
+    for idx, example in enumerate(examples, start=1):
+        blocks.append(f"Example {idx}:")
+        blocks.append(f"  question: {example.get('question', '').strip()}")
+        query_text = example.get('query', '').strip()
+        if query_text:
+            blocks.append(f"  query: {query_text}")
+        reasoning = example.get('reasoning', '').strip()
+        if reasoning:
+            blocks.append(f"  reasoning: {reasoning}")
+    return "\n".join(blocks)
+
+
+def _load_fk_join_map(path: str) -> Dict[str, List[str]]:
+    join_map = load_json_file(path)
+    if isinstance(join_map, dict):
+        return {str(k): list(v) for k, v in join_map.items() if isinstance(v, list)}
+    return {}
+
+
+def _format_fk_join_hints(tables: List[str], join_map: Dict[str, List[str]]) -> str:
+    hints: List[str] = []
+    seen: Set[str] = set()
+    for i in range(len(tables)):
+        for j in range(i + 1, len(tables)):
+            t1, t2 = tables[i], tables[j]
+            key = f"{t1}|{t2}"
+            alt_key = f"{t2}|{t1}"
+            columns = join_map.get(key) or join_map.get(alt_key)
+            if columns:
+                join_key = tuple(sorted([t1, t2]))
+                if join_key in seen:
+                    continue
+                seen.add(join_key)
+                hint_columns = ", ".join(columns)
+                hints.append(f"- {t1} JOIN {t2} on columns: {hint_columns}")
+    if not hints:
+        return ""
+    return "Join hints for selected tables:\n" + "\n".join(hints)
+
+
+def _extract_recent_texts(messages: List[BaseMessage], max_texts: int = 2) -> List[str]:
+    texts: List[str] = []
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            continue
+        content = get_message_text(msg)
+        if content:
+            texts.append(content.strip())
+        if len(texts) >= max_texts:
+            break
+    return list(reversed(texts))
+
+
+def _is_follow_up_question(text: str) -> bool:
+    follow_up_words = {
+        "it",
+        "that",
+        "those",
+        "these",
+        "same",
+        "also",
+        "then",
+        "again",
+        "previous",
+        "before",
+        "continue",
+        "follow",
+        "still",
+        "and",
+        "or",
+    }
+    tokens = set(_tokenize(text))
+    return len(tokens & follow_up_words) >= 1
 
 
 def _apply_result_limit(query: str, top_k: int) -> str:
@@ -394,8 +355,10 @@ Given an input question, create a syntactically correct {dialect} query to run.
 3. Select the relevant columns needed to answer the question. If the user asks for "all data from table X", use SELECT * FROM X.
 4. Order results by a relevant column to return the most interesting examples.
 5. Never use JOIN with unknown tables. Only join tables explicitly mentioned in the schema.
-6. DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
-7. Return ONLY the SQL query. No explanation or markdown formatting.
+6. When join hints are provided, use those columns to join selected tables.
+7. When example query patterns are provided, follow the same query style and reasoning approach.
+8. DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
+9. Return ONLY the SQL query. No explanation or markdown formatting.
 """.strip()
 
 
@@ -462,11 +425,21 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         return {"messages": messages + [AIMessage(content=clarification)]}
 
     schema_hint = _format_schema_for_prompt(data_dict, candidate_tables)
+    examples = _load_query_examples(QUERY_EXAMPLES_PATH)
+    selected_examples = _select_query_examples(user_question, examples, max_examples=3)
+    examples_hint = _format_query_examples_for_prompt(selected_examples)
+    fk_map = _load_fk_join_map(FK_JOIN_PATH)
+    fk_hint = _format_fk_join_hints(candidate_tables, fk_map)
+
     system_prompt = GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT)
     system_prompt += (
         "\n\nUse only the schema shown below. Do not invent new table names or columns. "
         "If the question cannot be answered from this schema, ask for clarification instead of guessing."
     )
+    if examples_hint:
+        system_prompt += "\n\n" + examples_hint
+    if fk_hint:
+        system_prompt += "\n\n" + fk_hint
     system_prompt += "\n\n" + schema_hint
 
     reasoning_message = ToolMessage(
@@ -479,8 +452,19 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         tool_call_id="schema_selection"
     )
 
+    recent_texts = _extract_recent_texts(messages, max_texts=2)
+    user_prompt_messages = []
+    if recent_texts:
+        if len(recent_texts) > 1 and _is_follow_up_question(recent_texts[-1]):
+            user_prompt_messages = [
+                {"role": "user", "content": recent_texts[-2]},
+                {"role": "user", "content": recent_texts[-1]},
+            ]
+        else:
+            user_prompt_messages = [{"role": "user", "content": recent_texts[-1]}]
+
     system_message = {"role": "system", "content": system_prompt}
-    response = llm.invoke([system_message] + messages)
+    response = llm.invoke([system_message] + user_prompt_messages)
     query = getattr(response, "content", str(response)).strip()
 
     if query.startswith("```sql"):
@@ -530,8 +514,6 @@ def check_query_safety(state: MessagesState) -> Dict[str, Any]:
     system_message = {"role": "system", "content": system_prompt}
     user_message = {"role": "user", "content": f"Review this query:\n{original_query}"}
 
-    query_examples = load_query_examples(QUERY_EXAMPLES_PATH)
-    join_hints = load_join_hints(FOREIGN_KEYS_PATH)
     response = llm.invoke([system_message, user_message])
     checked_query = getattr(response, "content", str(response)).strip()
     
@@ -541,48 +523,27 @@ def check_query_safety(state: MessagesState) -> Dict[str, Any]:
     if checked_query.startswith("```"):
         checked_query = checked_query[3:]
     if checked_query.endswith("```"):
-    context_referenced = _question_references_previous_context(user_question)
-    context_snippet = _build_context_snippet(messages, user_question) if context_referenced else ""
-    selected_examples = _select_relevant_examples(user_question, query_examples, max_examples=3)
-    examples_prompt = _format_examples_for_prompt(selected_examples)
         checked_query = checked_query[:-3]
-    join_hint_text = _format_join_hints_for_prompt(join_hints, candidate_tables)
-
-    prompt_sections = [
-        GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT),
-        "Use only the schema shown below. Do not invent new table names or columns. "
-        "If the question cannot be answered from this schema, ask for clarification instead of guessing.",
-        schema_hint,
-    ]
-
-    if join_hint_text:
-        prompt_sections.append(join_hint_text)
-
-    if examples_prompt:
-        prompt_sections.append(examples_prompt)
-
-    if context_snippet:
-        prompt_sections.append(context_snippet)
-
-    system_prompt = "\n\n".join(section for section in prompt_sections if section)
-
-    reasoning_lines = [
-        f"- Selected tables: {', '.join(candidate_tables)}",
-        f"- Source: {DATA_DICTIONARY_PATH}",
-        "- Matching uses table names, descriptions, column names, column descriptions, and sample values.",
-        f"- Previous context used: {'yes' if context_referenced else 'no'}",
-        f"- Examples used: {len(selected_examples)}",
-        f"- Join hints used: {'yes' if join_hint_text else 'no'}",
-    ]
     
+    # Remove semicolons and normalize whitespace
+    checked_query = _clean_query(checked_query).rstrip(";")
+    lc = checked_query.lower()
+    if "limit" not in lc and "fetch first" not in lc and "rownum" not in lc:
+        checked_query = checked_query + f" LIMIT {TOP_K_DEFAULT}"
+
+    # If the query changed, update the tool call
     if checked_query != original_query:
-        content="Schema reasoning:\n" + "\n".join(reasoning_lines),
+        updated_tool_call = {
+            "name": "sql_db_query",
+            "args": {"query": checked_query},
+            "id": "query_call_checked",
+            "type": "tool_call",
+        }
         return {
             "messages": messages + [
                 AIMessage(
                     content=f"Reviewed query:\n```sql\n{checked_query}\n```",
-    user_message = {"role": "user", "content": user_question}
-    response = llm.invoke([system_message, user_message])
+                    tool_calls=[updated_tool_call]
                 )
             ]
         }
