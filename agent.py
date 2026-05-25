@@ -18,7 +18,7 @@ from langchain_community.utilities import SQLDatabase
 
 from typing import Literal
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import AIMessage, ToolMessage, BaseMessage
+from langchain_core.messages import AIMessage, ToolMessage, BaseMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import MessagesState
 
@@ -466,6 +466,49 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         )
         return {"messages": messages + [AIMessage(content=error_message)]}
 
+    # *** CHECK FOR DIRECT SAMPLE QUERY MATCH FIRST ***
+    # If user's question exactly matches a sample query, use it immediately without schema validation
+    matched_example = _find_direct_query_example(user_question, query_examples)
+    sample_query = None
+    if matched_example:
+        sample_query = str(matched_example.get("query", "")).strip()
+        sample_query = _clean_query(sample_query)
+        if not _is_sql_query(sample_query):
+            matched_example = None
+            sample_query = None
+        else:
+            sample_query = _apply_result_limit(sample_query, TOP_K_DEFAULT)
+
+    # If we have a direct match, use it immediately before schema checks
+    if matched_example and sample_query:
+        reasoning_message = ToolMessage(
+            content=(
+                f"Direct match found in sample queries.\n"
+                f"- Question: {user_question}\n"
+                f"- Source: {QUERY_EXAMPLES_PATH}"
+            ),
+            tool_call_id="direct_sample_match"
+        )
+        tool_call = {
+            "name": "sql_db_query",
+            "args": {"query": sample_query},
+            "id": "query_call",
+            "type": "tool_call",
+        }
+        return {
+            "messages": messages + [
+                reasoning_message,
+                AIMessage(
+                    content=(
+                        "Found a matching query pattern in the sample queries file. "
+                        f"Using this query:\n```sql\n{sample_query}\n```"
+                    ),
+                    tool_calls=[tool_call]
+                )
+            ]
+        }
+
+    # *** IF NO DIRECT MATCH, PROCEED WITH SCHEMA-BASED QUERY GENERATION ***
     candidate_tables = _select_candidate_tables(user_question, data_dict, max_tables=5)
 
     if not candidate_tables:
@@ -476,15 +519,6 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         return {"messages": messages + [AIMessage(content=clarification)]}
 
     schema_hint = _format_schema_for_prompt(data_dict, candidate_tables)
-    matched_example = _find_direct_query_example(user_question, query_examples)
-
-    if matched_example:
-        sample_query = str(matched_example.get("query", "")).strip()
-        sample_query = _clean_query(sample_query)
-        if not _is_sql_query(sample_query):
-            matched_example = None
-        else:
-            sample_query = _apply_result_limit(sample_query, TOP_K_DEFAULT)
 
     selected_examples = _select_query_examples(user_question, query_examples, max_examples=3)
     examples_hint = _format_query_examples_for_prompt(selected_examples)
@@ -522,26 +556,6 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         else:
             user_prompt_messages = [{"role": "user", "content": recent_texts[-1]}]
 
-    if matched_example and sample_query:
-        tool_call = {
-            "name": "sql_db_query",
-            "args": {"query": sample_query},
-            "id": "query_call",
-            "type": "tool_call",
-        }
-        return {
-            "messages": messages + [
-                reasoning_message,
-                AIMessage(
-                    content=(
-                        "Matched a similar sample query pattern from the query examples file. "
-                        f"Using this query:\n```sql\n{sample_query}\n```"
-                    ),
-                    tool_calls=[tool_call]
-                )
-            ]
-        }
-
     system_message = {"role": "system", "content": system_prompt}
     response = llm.invoke([system_message] + user_prompt_messages)
     query = getattr(response, "content", str(response)).strip()
@@ -554,6 +568,13 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         query = query[:-3]
 
     query = _clean_query(query)
+    if query.strip().lower().startswith("error:"):
+        return {
+            "messages": messages + [
+                reasoning_message,
+                AIMessage(content=query)
+            ]
+        }
     if not _is_sql_query(query):
         return {
             "messages": messages + [
@@ -803,7 +824,7 @@ def main() -> None:
         return
 
     # Invoke agent with the question
-    result = agent.invoke({"messages": [AIMessage(content=question)]})
+    result = agent.invoke({"messages": [HumanMessage(content=question)]})
 
     # Print the conversation
     print("\n" + "=" * 60)
