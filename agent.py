@@ -241,7 +241,14 @@ def _select_query_examples(question: str, examples: List[Dict[str, Any]], max_ex
     for example in examples:
         example_question = str(example.get("question", ""))
         example_tokens = set(_tokenize(example_question))
-        score = len(question_tokens & example_tokens)
+        if not example_tokens:
+            continue
+        overlap = len(question_tokens & example_tokens)
+        score = overlap
+        if example_question.lower() in question.lower() or question.lower() in example_question.lower():
+            score += 5
+        if example_tokens.issubset(question_tokens) or question_tokens.issubset(example_tokens):
+            score += 3
         if score > 0:
             scored.append((score, example))
     scored.sort(key=lambda item: (-item[0], str(item[1].get("question", ""))))
@@ -446,7 +453,8 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
     system_prompt = GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT)
     system_prompt += (
         "\n\nUse only the schema shown below. Do not invent new table names or columns. "
-        "If the question cannot be answered from this schema, ask for clarification instead of guessing."
+        "Do not ask the user any follow-up questions. "
+        "If the question cannot be answered from this schema, respond with exactly: ERROR: insufficient schema context."
     )
     if examples_hint:
         system_prompt += "\n\n" + examples_hint
@@ -488,7 +496,12 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
 
     query = _clean_query(query)
     if not _is_sql_query(query):
-        return {"messages": messages + [reasoning_message, AIMessage(content=query)]}
+        return {
+            "messages": messages + [
+                reasoning_message,
+                AIMessage(content="ERROR: the model did not generate a valid SQL query.")
+            ]
+        }
 
     query = _apply_result_limit(query, TOP_K_DEFAULT)
 
