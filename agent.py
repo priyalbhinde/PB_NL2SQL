@@ -17,10 +17,10 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
 
 from typing import Literal
-from langchain.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode
 from langchain_core.messages import AIMessage, ToolMessage, BaseMessage
 from langgraph.graph import END, START, StateGraph
-from langgraph.graph.message import MessageState
+from langgraph.graph.message import MessagesState
 
 
 # ============================================================================
@@ -30,11 +30,15 @@ from langgraph.graph.message import MessageState
 DB_URL = os.environ.get("DB_URL", "sqlite:///:memory:")
 INCLUDE_TABLES: Optional[List[str]] = None
 DATA_DICTIONARY_PATH = os.environ.get("DATA_DICTIONARY_PATH", "data_dictionary.json")
+QUERY_EXAMPLES_PATH = os.environ.get("QUERY_EXAMPLES_PATH", "query_examples.json")
+FOREIGN_KEYS_PATH = os.environ.get("FOREIGN_KEYS_PATH", "foreign_keys.json")
 TOP_K_DEFAULT = 20
 
 # Cache for repeated queries and large schema support
 _DATA_DICTIONARY_CACHE: Dict[str, Any] = {}
 _SCHEMA_INDEX_CACHE: Optional[Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]] = None
+_QUERY_EXAMPLES_CACHE: Dict[str, Any] = {}
+_FOREIGN_KEYS_CACHE: Dict[str, Any] = {}
 
 # ============================================================================
 # Initialize LLM, Database, and Tools
@@ -81,8 +85,151 @@ def load_data_dictionary(path: str) -> Dict[str, Any]:
         return {}
 
 
+def load_json_payload(path: str, cache: Dict[str, Any]) -> Any:
+    """Load a JSON payload with simple path-based caching."""
+    if cache.get("path") == path:
+        return cache.get("data", {})
+
+    path_obj = Path(path)
+    if not path_obj.exists():
+        cache.clear()
+        cache.update({"path": path, "data": {}})
+        return {}
+
+    try:
+        with path_obj.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            cache.clear()
+            cache.update({"path": path, "data": data})
+            return data
+    except Exception:
+        cache.clear()
+        cache.update({"path": path, "data": {}})
+        return {}
+
+
+def load_query_examples(path: str) -> List[Dict[str, str]]:
+    """Load few-shot query examples from JSON."""
+    raw = load_json_payload(path, _QUERY_EXAMPLES_CACHE)
+    if isinstance(raw, dict):
+        raw = raw.get("Queries") or raw.get("queries") or raw.get("examples") or []
+
+    examples: List[Dict[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            question = str(item.get("question", "")).strip()
+            query = str(item.get("query", "")).strip()
+            reasoning = str(item.get("reasoning", "")).strip()
+            if question and query:
+                examples.append({"question": question, "query": query, "reasoning": reasoning})
+    return examples
+
+
+def load_join_hints(path: str) -> Dict[str, List[str]]:
+    """Load foreign-key join hints keyed by 'table1|table2'."""
+    raw = load_json_payload(path, _FOREIGN_KEYS_CACHE)
+    if not isinstance(raw, dict):
+        return {}
+
+    normalized: Dict[str, List[str]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, list):
+            continue
+        normalized[str(key)] = [str(item) for item in value if str(item).strip()]
+    return normalized
+
+
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9_]+", text.lower()) if len(t) > 1]
+
+
+def _question_references_previous_context(question: str) -> bool:
+    normalized = question.lower()
+    patterns = [
+        r"\bprevious\b",
+        r"\bpreceding\b",
+        r"\babove\b",
+        r"\bearlier\b",
+        r"\bas previous\b",
+        r"\bas above\b",
+        r"\bsame as\b",
+        r"\blike above\b",
+        r"\bthat one\b",
+        r"\bthose\b",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def _extract_user_turns(messages: List[BaseMessage]) -> List[str]:
+    turns: List[str] = []
+    for msg in messages:
+        if isinstance(msg, BaseMessage) and getattr(msg, "type", "") == "human":
+            content = getattr(msg, "content", "")
+            if isinstance(content, str) and content.strip():
+                turns.append(content.strip())
+    return turns
+
+
+def _build_context_snippet(messages: List[BaseMessage], current_question: str, max_turns: int = 2) -> str:
+    user_turns = [turn for turn in _extract_user_turns(messages) if turn != current_question]
+    if not user_turns:
+        return ""
+
+    recent_turns = user_turns[-max_turns:]
+    blocks = ["Relevant previous user context:"]
+    for index, turn in enumerate(recent_turns, start=1):
+        blocks.append(f"{index}. {turn}")
+    blocks.append(
+        "Use this context only because the latest question explicitly refers back to previous/above context. "
+        "If the latest question stands alone, ignore earlier turns."
+    )
+    return "\n".join(blocks)
+
+
+def _score_text_overlap(text: str, query_tokens: Set[str]) -> int:
+    return sum(1 for token in _tokenize(text) if token in query_tokens)
+
+
+def _select_relevant_examples(question: str, examples: List[Dict[str, str]], max_examples: int = 3) -> List[Dict[str, str]]:
+    if not examples:
+        return []
+
+    question_tokens = set(_tokenize(question))
+    scored = []
+    for example in examples:
+        combined = " ".join([
+            example.get("question", ""),
+            example.get("reasoning", ""),
+            example.get("query", ""),
+        ])
+        score = _score_text_overlap(combined, question_tokens)
+        if score > 0:
+            scored.append((score, example))
+
+    if not scored:
+        return examples[:max_examples]
+
+    scored.sort(key=lambda item: (-item[0], item[1].get("question", "")))
+    return [item[1] for item in scored[:max_examples]]
+
+
+def _format_examples_for_prompt(examples: List[Dict[str, str]]) -> str:
+    if not examples:
+        return ""
+
+    blocks = [
+        "Solved examples from your own query history:",
+        "Use these as structural patterns only. Do not copy tables or columns unless they exist in the current schema.",
+    ]
+    for index, example in enumerate(examples, start=1):
+        blocks.append(f"Example {index}:")
+        blocks.append(f"  question: {example.get('question', '')}")
+        if example.get("reasoning"):
+            blocks.append(f"  reasoning: {example.get('reasoning', '')}")
+        blocks.append(f"  query: {example.get('query', '')}")
+    return "\n".join(blocks)
 
 
 def _build_schema_index(data_dict: Dict[str, Any]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
@@ -165,10 +312,13 @@ def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> s
             name = col.get("name")
             col_type = col.get("type") or "UNKNOWN"
             col_desc = col.get("col_description") or ""
+            sample_values = col.get("_prompt_samples") or []
+            sample_text = ", ".join(str(value) for value in sample_values[:3] if str(value).strip())
+            sample_suffix = f" | samples: {sample_text}" if sample_text else ""
             if col_desc:
-                blocks.append(f"    - {name} ({col_type}): {col_desc}")
+                blocks.append(f"    - {name} ({col_type}): {col_desc}{sample_suffix}")
             else:
-                blocks.append(f"    - {name} ({col_type})")
+                blocks.append(f"    - {name} ({col_type}){sample_suffix}")
 
         foreign_keys = info.get("foreign_keys") or []
         if foreign_keys:
@@ -180,6 +330,32 @@ def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> s
             if fk_lines:
                 blocks.append("  foreign_keys:")
                 blocks.extend(fk_lines)
+
+    return "\n".join(blocks)
+
+
+def _format_join_hints_for_prompt(join_hints: Dict[str, List[str]], selected_tables: List[str]) -> str:
+    if len(selected_tables) < 2 or not join_hints:
+        return ""
+
+    selected = set(selected_tables)
+    blocks = [
+        "Join hints from the join-key dictionary:",
+        "Use these join columns when a query needs more than one table.",
+    ]
+
+    matched = False
+    for left_index, left_table in enumerate(selected_tables):
+        for right_table in selected_tables[left_index + 1:]:
+            forward_key = f"{left_table}|{right_table}"
+            reverse_key = f"{right_table}|{left_table}"
+            join_columns = join_hints.get(forward_key) or join_hints.get(reverse_key)
+            if join_columns:
+                matched = True
+                blocks.append(f"- {left_table} <-> {right_table}: join on {', '.join(join_columns)}")
+
+    if not matched:
+        return ""
 
     return "\n".join(blocks)
 
@@ -250,7 +426,7 @@ def _is_sql_query(text: str) -> bool:
 # Node Functions
 # ============================================================================
 
-def generate_sql_query(state: MessageState) -> Dict[str, Any]:
+def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
     """Generate SQL query from user question using schema hints.
     
     This node:
@@ -334,7 +510,7 @@ def generate_sql_query(state: MessageState) -> Dict[str, Any]:
     }
 
 
-def check_query_safety(state: MessageState) -> Dict[str, Any]:
+def check_query_safety(state: MessagesState) -> Dict[str, Any]:
     """Review and refine the generated query for safety and correctness."""
     messages: List[BaseMessage] = state.get("messages", [])
 
@@ -354,6 +530,8 @@ def check_query_safety(state: MessageState) -> Dict[str, Any]:
     system_message = {"role": "system", "content": system_prompt}
     user_message = {"role": "user", "content": f"Review this query:\n{original_query}"}
 
+    query_examples = load_query_examples(QUERY_EXAMPLES_PATH)
+    join_hints = load_join_hints(FOREIGN_KEYS_PATH)
     response = llm.invoke([system_message, user_message])
     checked_query = getattr(response, "content", str(response)).strip()
     
@@ -363,27 +541,48 @@ def check_query_safety(state: MessageState) -> Dict[str, Any]:
     if checked_query.startswith("```"):
         checked_query = checked_query[3:]
     if checked_query.endswith("```"):
+    context_referenced = _question_references_previous_context(user_question)
+    context_snippet = _build_context_snippet(messages, user_question) if context_referenced else ""
+    selected_examples = _select_relevant_examples(user_question, query_examples, max_examples=3)
+    examples_prompt = _format_examples_for_prompt(selected_examples)
         checked_query = checked_query[:-3]
-    
-    # Remove semicolons and normalize whitespace
-    checked_query = _clean_query(checked_query).rstrip(";")
-    lc = checked_query.lower()
-    if "limit" not in lc and "fetch first" not in lc and "rownum" not in lc:
-        checked_query = checked_query + f" LIMIT {TOP_K_DEFAULT}"
+    join_hint_text = _format_join_hints_for_prompt(join_hints, candidate_tables)
 
-    # If the query changed, update the tool call
+    prompt_sections = [
+        GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT),
+        "Use only the schema shown below. Do not invent new table names or columns. "
+        "If the question cannot be answered from this schema, ask for clarification instead of guessing.",
+        schema_hint,
+    ]
+
+    if join_hint_text:
+        prompt_sections.append(join_hint_text)
+
+    if examples_prompt:
+        prompt_sections.append(examples_prompt)
+
+    if context_snippet:
+        prompt_sections.append(context_snippet)
+
+    system_prompt = "\n\n".join(section for section in prompt_sections if section)
+
+    reasoning_lines = [
+        f"- Selected tables: {', '.join(candidate_tables)}",
+        f"- Source: {DATA_DICTIONARY_PATH}",
+        "- Matching uses table names, descriptions, column names, column descriptions, and sample values.",
+        f"- Previous context used: {'yes' if context_referenced else 'no'}",
+        f"- Examples used: {len(selected_examples)}",
+        f"- Join hints used: {'yes' if join_hint_text else 'no'}",
+    ]
+    
     if checked_query != original_query:
-        updated_tool_call = {
-            "name": "sql_db_query",
-            "args": {"query": checked_query},
-            "id": "query_call_checked",
-            "type": "tool_call",
-        }
+        content="Schema reasoning:\n" + "\n".join(reasoning_lines),
         return {
             "messages": messages + [
                 AIMessage(
                     content=f"Reviewed query:\n```sql\n{checked_query}\n```",
-                    tool_calls=[updated_tool_call]
+    user_message = {"role": "user", "content": user_question}
+    response = llm.invoke([system_message, user_message])
                 )
             ]
         }
@@ -405,7 +604,7 @@ def check_query_safety(state: MessageState) -> Dict[str, Any]:
         }
 
 
-def execute_query(state: MessageState) -> Dict[str, Any]:
+def execute_query(state: MessagesState) -> Dict[str, Any]:
     """Execute the SQL query and return results."""
     messages: List[BaseMessage] = state.get("messages", [])
 
@@ -466,12 +665,12 @@ def execute_query(state: MessageState) -> Dict[str, Any]:
 # Router Functions
 # ============================================================================
 
-def should_check_query(state: MessageState) -> Literal["check_query", "execute_query"]:
+def should_check_query(state: MessagesState) -> Literal["check_query", "execute_query"]:
     """Route to check_query step."""
     return "check_query"
 
 
-def should_execute(state: MessageState) -> Literal["execute_query", END]:
+def should_execute(state: MessagesState) -> Literal["execute_query", END]:
     """Always execute after checking."""
     return "execute_query"
 
@@ -484,7 +683,7 @@ def build_agent() -> StateGraph:
     """Build and return the compiled LangGraph agent."""
     
     # Create the state graph
-    builder = StateGraph(MessageState)
+    builder = StateGraph(MessagesState)
 
     # Add nodes
     builder.add_node("generate_query", generate_sql_query)
