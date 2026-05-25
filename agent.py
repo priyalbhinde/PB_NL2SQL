@@ -255,6 +255,38 @@ def _select_query_examples(question: str, examples: List[Dict[str, Any]], max_ex
     return [example for _, example in scored[:max_examples]]
 
 
+def _find_direct_query_example(question: str, examples: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a direct matching sample query when the user's question is similar enough."""
+    if not examples:
+        return None
+
+    normalized_question = question.strip().lower()
+    question_tokens = set(_tokenize(normalized_question))
+    best_match: Optional[Dict[str, Any]] = None
+    best_score = 0
+
+    for example in examples:
+        example_question = str(example.get("question", "")).strip()
+        if not example_question:
+            continue
+
+        normalized_example = example_question.lower()
+        example_tokens = set(_tokenize(normalized_example))
+        if not example_tokens:
+            continue
+
+        if normalized_example == normalized_question or normalized_example in normalized_question or normalized_question in normalized_example:
+            return example
+
+        overlap = len(question_tokens & example_tokens)
+        threshold = max(3, len(example_tokens) // 2, len(question_tokens) // 2)
+        if overlap >= threshold and overlap > best_score:
+            best_score = overlap
+            best_match = example
+
+    return best_match
+
+
 def _format_query_examples_for_prompt(examples: List[Dict[str, Any]]) -> str:
     if not examples:
         return ""
@@ -361,15 +393,13 @@ You are an expert SQL agent designed to interact with a large database (1500+ ta
 Given an input question, create a syntactically correct {dialect} query to run.
 
 **IMPORTANT RULES:**
-1. Use ONLY the tables and columns listed in the schema below.
-2. Always return results using LIMIT {top_k} unless the user asks for all data.
-3. Select the relevant columns needed to answer the question. If the user asks for "all data from table X", use SELECT * FROM X.
-4. Order results by a relevant column to return the most interesting examples.
-5. Never use JOIN with unknown tables. Only join tables explicitly mentioned in the schema.
-6. When join hints are provided, use those columns to join selected tables.
-7. When example query patterns are provided, follow the same query style and reasoning approach.
-8. DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
-9. Return ONLY the SQL query. No explanation or markdown formatting.
+1. Use only the tables and columns listed in the schema below.
+2. Prefer the smallest set of relevant columns needed to answer the question.
+3. Return results using LIMIT {top_k} unless the user asks for all data.
+4. Use provided join hints when joining selected tables.
+5. Follow matched sample query style when a similar example exists.
+6. Do not make any DML statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
+7. Return only the SQL query. No explanation or markdown formatting.
 """.strip()
 
 
@@ -446,6 +476,16 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         return {"messages": messages + [AIMessage(content=clarification)]}
 
     schema_hint = _format_schema_for_prompt(data_dict, candidate_tables)
+    matched_example = _find_direct_query_example(user_question, query_examples)
+
+    if matched_example:
+        sample_query = str(matched_example.get("query", "")).strip()
+        sample_query = _clean_query(sample_query)
+        if not _is_sql_query(sample_query):
+            matched_example = None
+        else:
+            sample_query = _apply_result_limit(sample_query, TOP_K_DEFAULT)
+
     selected_examples = _select_query_examples(user_question, query_examples, max_examples=3)
     examples_hint = _format_query_examples_for_prompt(selected_examples)
     fk_hint = _format_fk_join_hints(candidate_tables, fk_map)
@@ -453,7 +493,6 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
     system_prompt = GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT)
     system_prompt += (
         "\n\nUse only the schema shown below. Do not invent new table names or columns. "
-        "Do not ask the user any follow-up questions. "
         "If the question cannot be answered from this schema, respond with exactly: ERROR: insufficient schema context."
     )
     if examples_hint:
@@ -482,6 +521,26 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
             ]
         else:
             user_prompt_messages = [{"role": "user", "content": recent_texts[-1]}]
+
+    if matched_example and sample_query:
+        tool_call = {
+            "name": "sql_db_query",
+            "args": {"query": sample_query},
+            "id": "query_call",
+            "type": "tool_call",
+        }
+        return {
+            "messages": messages + [
+                reasoning_message,
+                AIMessage(
+                    content=(
+                        "Matched a similar sample query pattern from the query examples file. "
+                        f"Using this query:\n```sql\n{sample_query}\n```"
+                    ),
+                    tool_calls=[tool_call]
+                )
+            ]
+        }
 
     system_message = {"role": "system", "content": system_prompt}
     response = llm.invoke([system_message] + user_prompt_messages)
@@ -612,8 +671,8 @@ def execute_query(state: MessagesState) -> Dict[str, Any]:
     try:
         result = run_query_tool.invoke(query)
         result_str = str(result).strip()
-        
-        # Check if the result contains error indicators
+
+        # Detect errors in execution output
         error_indicators = [
             "Error:",
             "error executing query",
@@ -625,12 +684,44 @@ def execute_query(state: MessagesState) -> Dict[str, Any]:
             "database error",
             "exception",
         ]
-        
         is_error = any(indicator.lower() in result_str.lower() for indicator in error_indicators)
-        
+
+        # Detect zero-result responses
+        no_rows = False
+        if isinstance(result, list):
+            no_rows = len(result) == 0
+        elif isinstance(result, dict):
+            if result.get("rows") == [] or result.get("data") == []:
+                no_rows = True
+        elif hasattr(result, "rowcount"):
+            try:
+                no_rows = getattr(result, "rowcount") == 0
+            except Exception:
+                no_rows = False
+        elif hasattr(result, "rows"):
+            try:
+                no_rows = len(getattr(result, "rows")) == 0
+            except Exception:
+                no_rows = False
+
+        if not is_error and not no_rows:
+            if result_str.lower() in ("", "[]") or "no rows" in result_str.lower() or "0 rows" in result_str.lower():
+                no_rows = True
+
         if is_error:
             result_message = ToolMessage(
                 content=f"Error executing query:\n\n{result_str}",
+                tool_call_id=tool_call.get("id", "query_call")
+            )
+        elif no_rows:
+            result_message = ToolMessage(
+                content=(
+                    "Query executed successfully, but returned 0 rows. "
+                    "This means the SQL is syntactically valid, but the current data does not contain matching records. "
+                    "Please review the query filters or sample availability and consider revising the question or query.\n\n"
+                    f"Query:\n```sql\n{query}\n```\n\n"
+                    f"Output:\n{result_str}"
+                ),
                 tool_call_id=tool_call.get("id", "query_call")
             )
         else:
