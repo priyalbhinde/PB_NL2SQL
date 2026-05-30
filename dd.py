@@ -52,14 +52,13 @@ def table_has_at_least_n_rows(engine: Engine, table_name: str, n: int = 5) -> bo
 
 def extract_table_schema(engine: Engine, table_name: str) -> Dict[str, Any]:
     """
-    Pull column metadata, PK/FK info and (if the table has rows) a few distinct, non-NULL sample values (max SAMPLE_VALUES_PER_COLUMN per column).
+    Pull column metadata, PK info and (if the table has rows) a few distinct, non-NULL sample values (max SAMPLE_VALUES_PER_COLUMN per column).
     """
     print(f"\n=> Extracting schema for: {table_name}")
     inspector = inspect(engine)
     if table_name not in inspector.get_table_names():
         raise ValueError(f"Table {table_name} not found in the current schema")
     columns = inspector.get_columns(table_name)
-    fks = inspector.get_foreign_keys(table_name)
     pk_info = inspector.get_pk_constraint(table_name)
     pk_cols = pk_info.get("constrained_columns") or []
     has_rows = table_has_at_least_n_rows(engine, table_name, n=5)
@@ -81,33 +80,16 @@ def extract_table_schema(engine: Engine, table_name: str) -> Dict[str, Any]:
                     sample_vals = [str(r[0]) for r in rows]
                 except Exception as exc:
                     sample_vals = [f"(error: {exc})"]
-            fk_ref: Optional[Dict[str, str]] = None
-            for fk in fks:
-                if col_name in (fk.get("constrained_columns") or []):
-                    fk_ref = {
-                        "references_table": fk.get("referred_table"),
-                        "references_column": (fk.get("referred_columns") or [None])[0],
-                    }
-                    break
             enriched_columns.append({
                 "name": col_name,
                 "type": col_type,
                 "nullable": col.get("nullable", True),
                 "is_pk": col_name in pk_cols,
-                "foreign_key": fk_ref,
                 "_prompt_samples": sample_vals,
             })
     return {
         "table_name": table_name,
         "columns": enriched_columns,
-        "foreign_keys": [
-            {
-                "column": (fk.get("constrained_columns") or [None])[0],
-                "references_table": fk.get("referred_table"),
-                "references_column": (fk.get("referred_columns") or [None])[0],
-            }
-            for fk in fks
-        ],
         "has_rows": has_rows,
     }
 
@@ -117,15 +99,9 @@ def enrich_table_with_llm(raw_schema: Dict[str, Any], llm: ChatOpenAI) -> Dict[s
     col_lines: List[str] = []
     for col in raw_schema["columns"]:
         pk_tag = " [PK]" if col["is_pk"] else ""
-        fk_tag = ""
-        if col["foreign_key"]:
-            fk_tag = (
-                f' [FK -> {col["foreign_key"]["references_table"]}.'
-                f'{col["foreign_key"]["references_column"]}]'
-            )
         samples = ", ".join(col.get("_prompt_samples", [])[:3]) or "no samples"
         col_lines.append(
-            f' - {col["name"]} ({col["type"]}){pk_tag}{fk_tag} | samples: {samples}'
+            f' - {col["name"]} ({col["type"]}){pk_tag} | samples: {samples}'
         )
     col_block = "\n".join(col_lines)
     prompt = f"You are a senior {DOMAIN_CONTEXT} data analyst and database documentation expert.\n"
@@ -149,7 +125,6 @@ def enrich_table_with_llm(raw_schema: Dict[str, Any], llm: ChatOpenAI) -> Dict[s
                 "type": col["type"],
                 "nullable": col["nullable"],
                 "is_pk": col["is_pk"],
-                "foreign_key": col["foreign_key"],
                 "col_description": descriptions.get("column_descriptions", {}).get(col["name"], "")
             })
         return {
@@ -193,7 +168,6 @@ def print_report(dictionary: Dict[str, Any], elapsed_total: float) -> None:
         print(f" Has rows?: {'YES' if info.get('has_rows') else 'NO'}")
         print(f" Columns: {len(info.get('columns', []))}")
         print(f" LLM Latency: {meta.get('llm_latency_seconds', 'N/A')} s")
-        print(f" FKs found: {len(info.get('foreign_keys', []))}")
         print("Column Descriptions (first 8):")
         for col in info.get("columns", [])[:8]:
             desc = col.get("col_description", "(none)")

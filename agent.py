@@ -7,6 +7,7 @@ This agent uses a precomputed data dictionary to efficiently handle large schema
 import json
 import os
 import re
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -33,12 +34,27 @@ DATA_DICTIONARY_PATH = os.environ.get("DATA_DICTIONARY_PATH", "data_dictionary.j
 QUERY_EXAMPLES_PATH = os.environ.get("QUERY_EXAMPLES_PATH", "query_examples.json")
 FK_JOIN_PATH = os.environ.get("FK_JOIN_PATH", "foreign_keys.json")
 TOP_K_DEFAULT = 20
+SCRIPT_DIR = Path(__file__).resolve().parent
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 # Cache for repeated queries and large schema support
 _DATA_DICTIONARY_CACHE: Dict[str, Any] = {}
 _QUERY_EXAMPLES_CACHE: Dict[str, Any] = {}
 _FK_JOIN_CACHE: Dict[str, Any] = {}
 _SCHEMA_INDEX_CACHE: Optional[Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]] = None
+_SCHEMA_INDEX_SOURCE: Optional[str] = None
+
+
+def _resolve_path(path: str) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    script_candidate = SCRIPT_DIR / candidate
+    if script_candidate.exists():
+        return script_candidate
+    return Path.cwd() / candidate
 
 # ============================================================================
 # Initialize LLM, Database, and Tools
@@ -67,48 +83,56 @@ run_query_node = ToolNode([run_query_tool], name="run_query")
 def load_data_dictionary(path: str) -> Dict[str, Any]:
     """Load (and cache) the data dictionary JSON produced by dd.py."""
     global _DATA_DICTIONARY_CACHE
-    if _DATA_DICTIONARY_CACHE.get("path") == path:
+    resolved_path = str(_resolve_path(path))
+    if _DATA_DICTIONARY_CACHE.get("path") == resolved_path:
         return _DATA_DICTIONARY_CACHE.get("data", {})
 
-    path_obj = Path(path)
+    path_obj = Path(resolved_path)
     if not path_obj.exists():
-        _DATA_DICTIONARY_CACHE = {"path": path, "data": {}}
+        logger.warning("Data dictionary file not found: %s", path_obj)
+        _DATA_DICTIONARY_CACHE = {"path": resolved_path, "data": {}}
         return {}
 
     try:
         with path_obj.open("r", encoding="utf-8") as f:
             data = json.load(f)
-            _DATA_DICTIONARY_CACHE = {"path": path, "data": data}
+            _DATA_DICTIONARY_CACHE = {"path": resolved_path, "data": data}
+            logger.info("Loaded data dictionary: %s tables from %s", len(data) if isinstance(data, dict) else 0, path_obj)
             return data
     except Exception:
-        _DATA_DICTIONARY_CACHE = {"path": path, "data": {}}
+        logger.exception("Failed to load data dictionary: %s", path_obj)
+        _DATA_DICTIONARY_CACHE = {"path": resolved_path, "data": {}}
         return {}
 
 
 def load_json_file(path: str) -> Any:
     """Load any JSON file and cache by path."""
+    resolved_path = str(_resolve_path(path))
     cache = _QUERY_EXAMPLES_CACHE if path == QUERY_EXAMPLES_PATH else _FK_JOIN_CACHE if path == FK_JOIN_PATH else None
-    if cache is not None and cache.get("path") == path:
+    if cache is not None and cache.get("path") == resolved_path:
         return cache.get("data")
 
-    path_obj = Path(path)
+    path_obj = Path(resolved_path)
     if not path_obj.exists():
         if cache is not None:
-            cache["path"] = path
+            cache["path"] = resolved_path
             cache["data"] = None
+        logger.warning("JSON file not found: %s", path_obj)
         return None
 
     try:
         with path_obj.open("r", encoding="utf-8") as f:
             data = json.load(f)
             if cache is not None:
-                cache["path"] = path
+                cache["path"] = resolved_path
                 cache["data"] = data
+            logger.info("Loaded JSON file: %s", path_obj)
             return data
     except Exception:
         if cache is not None:
-            cache["path"] = path
+            cache["path"] = resolved_path
             cache["data"] = None
+        logger.exception("Failed to load JSON file: %s", path_obj)
         return None
 
 
@@ -145,6 +169,18 @@ def _build_schema_index(data_dict: Dict[str, Any]) -> Tuple[Dict[str, Set[str]],
     return table_index, column_index
 
 
+def _get_schema_index(data_dict: Dict[str, Any]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    global _SCHEMA_INDEX_CACHE, _SCHEMA_INDEX_SOURCE
+    source_fingerprint = f"{len(data_dict)}:{','.join(sorted(data_dict.keys())[:10])}"
+    if _SCHEMA_INDEX_CACHE is not None and _SCHEMA_INDEX_SOURCE == source_fingerprint:
+        return _SCHEMA_INDEX_CACHE
+
+    _SCHEMA_INDEX_CACHE = _build_schema_index(data_dict)
+    _SCHEMA_INDEX_SOURCE = source_fingerprint
+    logger.info("Built schema index for %s tables", len(data_dict))
+    return _SCHEMA_INDEX_CACHE
+
+
 def _select_candidate_tables(
     question: str,
     data_dict: Dict[str, Any],
@@ -155,7 +191,7 @@ def _select_candidate_tables(
         return []
 
     question_tokens = set(_tokenize(question))
-    table_index, column_index = _build_schema_index(data_dict)
+    table_index, column_index = _get_schema_index(data_dict)
 
     scores: Dict[str, int] = {}
     for tok in question_tokens:
@@ -167,10 +203,30 @@ def _select_candidate_tables(
             scores[tbl] = scores.get(tbl, 0) + 4
 
     ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    if not ranked:
-        return []
+    if ranked:
+        selected = [t for t, score in ranked if score > 0][:max_tables]
+        logger.info("Candidate tables selected via keyword scoring: %s", selected)
+        return selected
 
-    selected = [t for t, score in ranked if score > 0][:max_tables]
+    fallback_scores: Dict[str, int] = {}
+    normalized_question = question.lower()
+    for table_name, info in data_dict.items():
+        table_name_lc = table_name.lower()
+        if any(token in table_name_lc for token in question_tokens) or any(token in normalized_question for token in _tokenize(table_name_lc)):
+            fallback_scores[table_name] = fallback_scores.get(table_name, 0) + 3
+
+        for col in info.get("columns", []):
+            col_name = str(col.get("name", "")).lower()
+            col_desc = str(col.get("col_description", "")).lower()
+            if any(token in col_name for token in question_tokens) or any(token in normalized_question for token in _tokenize(col_name)):
+                fallback_scores[table_name] = fallback_scores.get(table_name, 0) + 2
+            if col_desc and any(token in col_desc for token in question_tokens):
+                fallback_scores[table_name] = fallback_scores.get(table_name, 0) + 1
+
+    fallback_ranked = sorted(fallback_scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    selected = [t for t, score in fallback_ranked if score > 0][:max_tables]
+    if selected:
+        logger.info("Candidate tables selected via fallback scoring: %s", selected)
     return selected
 
 
@@ -204,17 +260,6 @@ def _format_schema_for_prompt(data_dict: Dict[str, Any], tables: List[str]) -> s
             if sample_values:
                 samples = ", ".join(sample_values[:3])
                 blocks.append(f"      sample_values: {samples}")
-
-        foreign_keys = info.get("foreign_keys") or []
-        if foreign_keys:
-            fk_lines = [
-                f"    - {fk.get('column')} -> {fk.get('references_table')}.{fk.get('references_column')}"
-                for fk in foreign_keys
-                if fk.get('column') and fk.get('references_table')
-            ]
-            if fk_lines:
-                blocks.append("  foreign_keys:")
-                blocks.extend(fk_lines)
 
     return "\n".join(blocks)
 
@@ -380,8 +425,8 @@ def _apply_result_limit(query: str, top_k: int) -> str:
     # Don't add limit if one already exists
     if "limit" in lc or "fetch first" in lc or "rownum" in lc or "offset" in lc:
         return query
-    # Only add limit if user isn't asking for all rows explicitly
-    return query + f" LIMIT {top_k}"
+    # Oracle-compatible default row limiting
+    return query + f" FETCH FIRST {top_k} ROWS ONLY"
 
 
 # ============================================================================
@@ -389,17 +434,18 @@ def _apply_result_limit(query: str, top_k: int) -> str:
 # ============================================================================
 
 GENERATE_QUERY_SYSTEM_PROMPT = """
-You are an expert SQL agent designed to interact with a large database (1500+ tables, billions of rows).
-Given an input question, create a syntactically correct {dialect} query to run.
+You are an expert SQL generator for a large Oracle-backed reporting system.
+Given an input question and a small schema slice, output exactly one safe SQL query.
 
-**IMPORTANT RULES:**
-1. Use only the tables and columns listed in the schema below.
-2. Prefer the smallest set of relevant columns needed to answer the question.
-3. Return results using LIMIT {top_k} unless the user asks for all data.
-4. Use provided join hints when joining selected tables.
-5. Follow matched sample query style when a similar example exists.
-6. Do not make any DML statements (INSERT, UPDATE, DELETE, DROP, ALTER, etc.).
-7. Return only the SQL query. No explanation or markdown formatting.
+Rules:
+1. Use only the tables and columns shown in the schema context.
+2. Prefer the minimum columns and joins needed to answer the question.
+3. Use Oracle-safe row limiting: FETCH FIRST {top_k} ROWS ONLY unless the user explicitly asks for all rows.
+4. Do not invent table names, column names, filters, or joins.
+5. Do not output explanations, markdown, code fences, or comments.
+6. Do not output any DML/DDL statements.
+7. If the schema context is insufficient, return exactly: ERROR: insufficient schema context.
+8. If a similar example query is present, follow its structure but adapt only to the provided schema.
 """.strip()
 
 
@@ -457,14 +503,16 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
 
     data_dict = load_data_dictionary(DATA_DICTIONARY_PATH)
     query_examples = _load_query_examples(QUERY_EXAMPLES_PATH)
-    fk_map = _load_fk_join_map(FK_JOIN_PATH)
-
-    if query_examples is None or fk_map is None:
+    if not query_examples:
         error_message = (
-            "Required configuration is missing. The query examples file or foreign-key join file "
-            "could not be loaded. Please ensure QUERY_EXAMPLES_PATH and FK_JOIN_PATH are set and the files exist."
+            "Required configuration is missing. The query examples file could not be loaded or is empty. "
+            "Please ensure QUERY_EXAMPLES_PATH is set and the file exists."
         )
         return {"messages": messages + [AIMessage(content=error_message)]}
+
+    logger.info("Incoming question: %s", user_question)
+    logger.info("Loaded data dictionary tables: %s", len(data_dict))
+    logger.info("Loaded query examples: %s", len(query_examples))
 
     # *** CHECK FOR DIRECT SAMPLE QUERY MATCH FIRST ***
     # If user's question exactly matches a sample query, use it immediately without schema validation
@@ -478,6 +526,11 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
             sample_query = None
         else:
             sample_query = _apply_result_limit(sample_query, TOP_K_DEFAULT)
+            logger.info(
+                "Direct example match found for question='%s' using example question='%s'",
+                user_question,
+                matched_example.get("question", ""),
+            )
 
     # If we have a direct match, use it immediately before schema checks
     if matched_example and sample_query:
@@ -509,30 +562,33 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         }
 
     # *** IF NO DIRECT MATCH, PROCEED WITH SCHEMA-BASED QUERY GENERATION ***
-    candidate_tables = _select_candidate_tables(user_question, data_dict, max_tables=5)
+    candidate_tables = _select_candidate_tables(user_question, data_dict, max_tables=8)
+    logger.info("Selected candidate tables: %s", candidate_tables)
 
     if not candidate_tables:
         clarification = (
-            "I cannot safely generate a query because the question does not match any tables or columns "
-            "in the provided data dictionary. Please clarify your request or provide more context."
+            "I need a little more detail to answer this safely. Please clarify the metric, table subject, or date range."
         )
         return {"messages": messages + [AIMessage(content=clarification)]}
 
     schema_hint = _format_schema_for_prompt(data_dict, candidate_tables)
+    logger.info("Schema hint length: %s characters", len(schema_hint))
 
     selected_examples = _select_query_examples(user_question, query_examples, max_examples=3)
     examples_hint = _format_query_examples_for_prompt(selected_examples)
-    fk_hint = _format_fk_join_hints(candidate_tables, fk_map)
+    if selected_examples:
+        logger.info(
+            "Selected example questions: %s",
+            [example.get("question", "") for example in selected_examples],
+        )
 
     system_prompt = GENERATE_QUERY_SYSTEM_PROMPT.format(dialect=dialect, top_k=TOP_K_DEFAULT)
     system_prompt += (
-        "\n\nUse only the schema shown below. Do not invent new table names or columns. "
-        "If the question cannot be answered from this schema, respond with exactly: ERROR: insufficient schema context."
+        "\n\nFollow this workflow: infer the business intent from the user question, choose only the most relevant tables, "
+        "and write the query with Oracle-safe syntax. If you cannot answer from the supplied schema, return exactly: ERROR: insufficient schema context."
     )
     if examples_hint:
         system_prompt += "\n\n" + examples_hint
-    if fk_hint:
-        system_prompt += "\n\n" + fk_hint
     system_prompt += "\n\n" + schema_hint
 
     reasoning_message = ToolMessage(
@@ -559,6 +615,7 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
     system_message = {"role": "system", "content": system_prompt}
     response = llm.invoke([system_message] + user_prompt_messages)
     query = getattr(response, "content", str(response)).strip()
+    logger.info("Raw model output: %s", query[:1000])
 
     if query.startswith("```sql"):
         query = query[6:]
@@ -569,6 +626,7 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
 
     query = _clean_query(query)
     if query.strip().lower().startswith("error:"):
+        logger.info("Model returned a schema-insufficient error for question: %s", user_question)
         return {
             "messages": messages + [
                 reasoning_message,
@@ -576,6 +634,7 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
             ]
         }
     if not _is_sql_query(query):
+        logger.warning("Model output was not valid SQL for question='%s': %s", user_question, query)
         return {
             "messages": messages + [
                 reasoning_message,
@@ -584,6 +643,7 @@ def generate_sql_query(state: MessagesState) -> Dict[str, Any]:
         }
 
     query = _apply_result_limit(query, TOP_K_DEFAULT)
+    logger.info("Final query sent to execution: %s", query)
 
     tool_call = {
         "name": "sql_db_query",
@@ -621,6 +681,7 @@ def check_query_safety(state: MessagesState) -> Dict[str, Any]:
 
     response = llm.invoke([system_message, user_message])
     checked_query = getattr(response, "content", str(response)).strip()
+    logger.info("Safety check raw output: %s", checked_query[:1000])
     
     # Clean up query: remove markdown code blocks and semicolons
     if checked_query.startswith("```sql"):
@@ -632,9 +693,7 @@ def check_query_safety(state: MessagesState) -> Dict[str, Any]:
     
     # Remove semicolons and normalize whitespace
     checked_query = _clean_query(checked_query).rstrip(";")
-    lc = checked_query.lower()
-    if "limit" not in lc and "fetch first" not in lc and "rownum" not in lc:
-        checked_query = checked_query + f" LIMIT {TOP_K_DEFAULT}"
+    checked_query = _apply_result_limit(checked_query, TOP_K_DEFAULT)
 
     # If the query changed, update the tool call
     if checked_query != original_query:
@@ -687,11 +746,13 @@ def execute_query(state: MessagesState) -> Dict[str, Any]:
 
     # Remove trailing semicolon from query before execution
     query = query.rstrip(";")
+    logger.info("Executing query: %s", query)
 
     # Execute query using the toolkit tool
     try:
         result = run_query_tool.invoke(query)
         result_str = str(result).strip()
+        logger.info("Execution result preview: %s", result_str[:1000])
 
         # Detect errors in execution output
         error_indicators = [
@@ -751,6 +812,7 @@ def execute_query(state: MessagesState) -> Dict[str, Any]:
                 tool_call_id=tool_call.get("id", "query_call")
             )
     except Exception as e:
+        logger.exception("Query execution failed")
         result_message = ToolMessage(
             content=f"Error executing query: {str(e)}",
             tool_call_id=tool_call.get("id", "query_call")
@@ -809,14 +871,17 @@ agent = build_agent()
 def main() -> None:
     """Interactive CLI for testing the agent."""
     print(f"Connected to database: {DB_URL}")
+    logger.info("Agent startup: data_dictionary=%s query_examples=%s fk_join=%s", DATA_DICTIONARY_PATH, QUERY_EXAMPLES_PATH, FK_JOIN_PATH)
 
     data_dict = load_data_dictionary(DATA_DICTIONARY_PATH)
     if data_dict:
         tables = sorted(data_dict.keys())
         print(f"Loaded schema for {len(tables)} tables from {DATA_DICTIONARY_PATH}")
         print("Example tables:", ", ".join(tables[:10]))
+        logger.info("Startup loaded %s tables", len(tables))
     else:
         print("No data dictionary found.")
+        logger.warning("Startup did not load any tables from the data dictionary")
 
     question = input("\nEnter a natural language question: ").strip()
     if not question:
